@@ -1,0 +1,183 @@
+function getAccessToken() {
+
+const jsonCredentials = PropertiesService.getScriptProperties().getProperty('SA_JSON');
+const serviceAccount = JSON.parse(jsonCredentials);
+
+  // Encode the JWT header
+  const header = {
+    "alg": "RS256",
+    "typ": "JWT"
+  };
+  const encodedHeader = Utilities.base64EncodeWebSafe(JSON.stringify(header));
+
+  // Encode the JWT claim set
+  const now = Math.floor(Date.now() / 1000);
+  const claimSet = {
+    "iss": serviceAccount.client_email,
+    "scope": "https://www.googleapis.com/auth/cloud-platform", 
+    "aud": "https://oauth2.googleapis.com/token",
+    "exp": now + 3600,
+    "iat": now
+  };
+  const encodedClaimSet = Utilities.base64EncodeWebSafe(JSON.stringify(claimSet));
+
+  // Sign the JWT using the private key
+  const signatureInput = `${encodedHeader}.${encodedClaimSet}`;
+  const signature = Utilities.computeRsaSha256Signature(signatureInput, serviceAccount.private_key);
+  const encodedSignature = Utilities.base64EncodeWebSafe(signature);
+
+  // Form the JWT assertion
+  const jwt = `${signatureInput}.${encodedSignature}`;
+
+  // Make a request to get the access token
+  const tokenUrl = "https://oauth2.googleapis.com/token";
+  const payload = {
+    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    "assertion": jwt
+  };
+
+  const options = {
+    "method": "post",
+    "payload": payload
+  };
+
+  const response = UrlFetchApp.fetch(tokenUrl, options);
+  const token = JSON.parse(response.getContentText()).access_token;
+  
+  return token;
+}
+
+function getCount(environment, timeRange, accessToken, orgname ) {
+  let url = "https://apigee.googleapis.com/v1/organizations" + orgname + "environments/" + environment + "/stats?select=sum(message_count)&timeRange=" + timeRange ;
+  let metricValue = 0;
+  let options = {
+    method: "get",
+    headers: {
+      "Authorization": "Bearer " + accessToken
+    },
+    muteHttpExceptions: true //  keeps script from stopping on HTTP error responses
+  };
+
+  try {
+    let response = UrlFetchApp.fetch(url, options);
+    let responseCode = response.getResponseCode();
+
+    if (responseCode === 200) {
+      // Parse the response as JSON
+      let responseData = JSON.parse(response.getContentText());
+      metricValue = responseData.environments[0].metrics[0].values[0];
+    }
+ 
+  }catch (e) {
+    Logger.log("Error: " + e.message);
+  }
+  return metricValue;
+};
+
+function main() {
+
+  const orgname = "/glbl-apigee-nonprod/";  // APIGEE ORG Name
+  const apigeeEnvs = ["glbl-dev1", "glbl-dev2", "glbl-qa1", "glbl-qa2"];  //APIGEE envs Name
+
+  const accessToken = getAccessToken();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const timeDetails = calculateTimeRange();
+  const timeRange = timeDetails.timeRange;
+  const monthKey = timeDetails.key;
+  
+  let allEnvCount = 0;
+
+  for (let i = 0; i < apigeeEnvs.length; i++) {
+        let envCount = 0;
+        try {
+            envCount = getCount(apigeeEnvs[i],timeRange ,  accessToken, orgname);
+            allEnvCount = Number(allEnvCount) + Number(envCount);
+            updateSheet(spreadsheet, apigeeEnvs[i], Number(envCount).toLocaleString(),monthKey)
+        } catch (e) {
+          console.log(e.message)
+        }      
+  }
+  
+  updateSheet(spreadsheet, 'AllEnv', allEnvCount.toLocaleString(), monthKey)
+ 
+};
+
+function calculateTimeRange() {
+
+  const monthNames = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ];
+  const today = new Date();
+  //const today = new Date('2024-04-01');
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+
+  const year = yesterday.getFullYear();
+  const month = yesterday.getMonth(); // 0-based index for months (0 = January ..., 11 = December)
+
+    // Find the first and last date of the month
+     const firstDate = Utilities.formatDate(new Date(year, month, 1), 'UTC', "MM/dd/yyyy") + " 00:00";
+     const lastDate = Utilities.formatDate(new Date(year, month + 1, 0), 'UTC', "MM/dd/yyyy") + " 23:59";
+     const monthName = monthNames[month];
+     const timeRange = firstDate + "~" + lastDate;
+     const key = "Month -" + monthName + " " + year
+
+    console.log(key, timeRange);
+    return {
+        key: key,
+        timeRange: timeRange        
+    };
+}
+
+function updateSheet (spreadsheet, environment, metricValue, monthKey) {
+  
+  let sheet = spreadsheet.getSheetByName(environment);
+  let rowData = [monthKey, metricValue];
+
+
+      if (!sheet) {
+        // If the sheet does not exist, create it
+        sheet = spreadsheet.insertSheet(environment);
+        var headerValues = ["Month", "API Call Count"];
+        sheet.appendRow(headerValues);
+      } 
+
+      const lastRow = sheet.getLastRow();
+    
+    // To update only the last 13 days records
+      const numRecordsToLoad = 13;
+
+    // Calculate the starting row number
+      const startRow = Math.max(lastRow - numRecordsToLoad + 1, 1);
+
+      const range = sheet.getRange(startRow, 1, numRecordsToLoad, sheet.getLastColumn());
+      const existingData = range.getValues();
+
+      const idToRowMap = {};
+      
+    for (let i = 0; i < existingData.length; i++) {
+        let id = null;
+        try {
+            id =existingData[i][0];                      
+            idToRowMap[id] = i + startRow;
+        } catch (e) {
+          console.log(e.message)
+        }
+        
+        
+    }
+
+    
+    if (monthKey in idToRowMap) {
+            // Update the existing row.
+            const rowNum = idToRowMap[monthKey];
+            sheet.getRange(rowNum, 1, 1, rowData.length).setValues([rowData]);
+        } else {
+            // Append the new row.
+            sheet.appendRow(rowData);
+        }
+      
+
+}
+ 
+  
